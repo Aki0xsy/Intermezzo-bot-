@@ -319,6 +319,16 @@ async def cb_confirm(callback: CallbackQuery, state: FSMContext, bot: Bot) -> No
         await callback.answer()
         return
 
+    required = ("name", "age", "country", "minecraft_nick", "discord_nick")
+    if any(not str(data.get(field, "")).strip() for field in required):
+        await state.clear()
+        await callback.answer("Сессия заявки устарела", show_alert=True)
+        await callback.message.answer(
+            "⚠️ Сессия заявки устарела.\n\nНачни регистрацию заново: нажми «📝 Заполнить заявку».",
+            reply_markup=main_menu_kb(),
+        )
+        return
+
     ok, msg = storage.save_application(
         telegram_id=callback.from_user.id,
         telegram_username=callback.from_user.username,
@@ -330,6 +340,7 @@ async def cb_confirm(callback: CallbackQuery, state: FSMContext, bot: Bot) -> No
         return
 
     await state.clear()
+    await callback.answer("Заявка отправлена!")
     await callback.message.answer(
         "🎉 <b>Заявка отправлена!</b>\n\n"
         f"{format_summary(data)}\n\n"
@@ -338,9 +349,8 @@ async def cb_confirm(callback: CallbackQuery, state: FSMContext, bot: Bot) -> No
         reply_markup=main_menu_kb(),
         parse_mode=ParseMode.HTML,
     )
-    await callback.answer("Заявка отправлена!")
 
-        # Пишем в Google Sheets
+    # Пишем в Google Sheets
     try:
         sheets_ok = await sheets.append_application(data, callback.from_user.id, callback.from_user.username)
         if not sheets_ok and config.GOOGLE_SHEETS_ID:
