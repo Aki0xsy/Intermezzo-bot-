@@ -81,7 +81,7 @@ def append_row_sync(row: list[str]) -> bool:
             return False
         sh = client.open_by_key(sheet_id)
         ws = _resolve_worksheet(sh)
-        ws.append_row(row, value_input_option="USER_ENTERED")
+        ws.append_row(row, value_input_option="RAW")
         log.info("Google Sheets: row appended")
         return True
     except Exception as e:  # noqa: BLE001
@@ -103,31 +103,52 @@ def ensure_header_sync() -> bool:
         ws = _resolve_worksheet(sh)
         vals = ws.get_all_values()
         if not vals or not any(c.strip() for c in vals[0]):
-            ws.append_row(config.SHEET_HEADER, value_input_option="USER_ENTERED")
+            ws.append_row(config.SHEET_HEADER, value_input_option="RAW")
             log.info("Google Sheets: header created")
+        else:
+            # дописываем новые колонки (Принял / Пароль / Блокировка), не трогая существующую шапку
+            row1 = vals[0]
+            for idx, title in enumerate(config.SHEET_HEADER):
+                if idx >= 9 and (len(row1) <= idx or not row1[idx].strip()):
+                    ws.update_cell(1, idx + 1, title)
         return True
     except Exception as e:  # noqa: BLE001
         log.warning("Google Sheets ensure_header failed: %s", e)
         return False
 
 
-def update_status_sync(telegram_id: int, status: str) -> bool:
-    """Обновляет колонку «Статус» (9-я) в строке игрока (Telegram ID — 7-я колонка)."""
+def update_row_sync(telegram_id: int, values: dict[int, str]) -> bool:
+    """Обновляет ячейки в строке игрока (поиск по Telegram ID в 7-й колонке; если строк
+    несколько — берётся последняя). values: {номер_колонки: значение}. Колонки: 9 — Статус,
+    10 — Принял (админ), 11 — Пароль, 12 — Блокировка."""
     if not config.GOOGLE_SHEETS_ID:
         return False
     try:
+        from gspread.utils import rowcol_to_a1
+
         client = _get_client()
         if client is None:
             return False
         ws = _resolve_worksheet(client.open_by_key(config.GOOGLE_SHEETS_ID))
-        cell = ws.find(str(telegram_id), in_column=7)
-        if cell is None:
+        cells = ws.findall(str(telegram_id), in_column=7)
+        if not cells:
+            log.warning("Google Sheets: строка с Telegram ID %s не найдена", telegram_id)
             return False
-        ws.update_cell(cell.row, 9, status)
+        row = cells[-1].row
+        ws.batch_update(
+            [{"range": rowcol_to_a1(row, col), "values": [[val]]} for col, val in values.items()],
+            value_input_option="RAW",
+        )
         return True
     except Exception as e:  # noqa: BLE001
-        log.warning("Google Sheets status update failed: %s", e)
+        log.warning("Google Sheets row update failed: %s", e)
         return False
+
+
+async def update_row(telegram_id: int, values: dict[int, str]) -> bool:
+    if not config.GOOGLE_SHEETS_ID:
+        return False
+    return await asyncio.to_thread(update_row_sync, telegram_id, values)
 
 
 def build_row(data: dict, telegram_id: int, telegram_username: str | None) -> list[str]:

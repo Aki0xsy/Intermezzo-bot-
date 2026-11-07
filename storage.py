@@ -38,9 +38,14 @@ def init_db(db_path: Path | None = None) -> None:
         )
         # миграция старой базы: пароль, кто и когда рассмотрел заявку
         cols = {r[1] for r in conn.execute("PRAGMA table_info(registrations)")}
-        for col in ("password", "reviewed_by", "reviewed_at"):
+        for col, typ in (
+            ("password", "TEXT"), ("reviewed_by", "TEXT"), ("reviewed_at", "TEXT"),
+            ("blocked_until", "TEXT"), ("blocked_by", "TEXT"),
+            ("restore_status", "TEXT"),                 # NULL / requested / denied
+            ("expiry_notified", "INTEGER NOT NULL DEFAULT 0"),
+        ):
             if col not in cols:
-                conn.execute(f"ALTER TABLE registrations ADD COLUMN {col} TEXT")
+                conn.execute(f"ALTER TABLE registrations ADD COLUMN {col} {typ}")
         conn.commit()
 
 
@@ -141,3 +146,78 @@ def set_password(telegram_id: int, password: str, db_path: Path | None = None) -
         )
         conn.commit()
         return cur.rowcount == 1
+
+
+def get_by_nick(nick: str, db_path: Path | None = None):
+    return _one(
+        "SELECT * FROM registrations WHERE lower(minecraft_nick) = lower(?) AND status != 'rejected'",
+        (nick,), db_path,
+    )
+
+
+def _exec(sql: str, args: tuple, db_path: Path | None = None) -> int:
+    init_db(db_path)
+    with closing(get_conn(db_path)) as conn:
+        cur = conn.execute(sql, args)
+        conn.commit()
+        return cur.rowcount
+
+
+def block(reg_id: int, admin_id: int, hours: int = 24, db_path: Path | None = None) -> bool:
+    """Блокировка одобренного аккаунта на N часов. False, если аккаунт не в статусе approved."""
+    return _exec(
+        "UPDATE registrations SET status='blocked', blocked_until=datetime('now', ?), blocked_by=?, "
+        "restore_status=NULL, expiry_notified=0 WHERE id=? AND status='approved'",
+        (f"+{int(hours)} hours", str(admin_id), reg_id), db_path,
+    ) == 1
+
+
+def unblock(reg_id: int, db_path: Path | None = None) -> bool:
+    """Ручная разблокировка админом."""
+    return _exec(
+        "UPDATE registrations SET status='approved', blocked_until=NULL, restore_status=NULL, "
+        "expiry_notified=0 WHERE id=? AND status='blocked'",
+        (reg_id,), db_path,
+    ) == 1
+
+
+def is_block_expired(reg, db_path: Path | None = None) -> bool:
+    row = _one("SELECT datetime('now') >= ?", (reg["blocked_until"] or "",), db_path)
+    return bool(row[0])
+
+
+def due_expiry_notifications(db_path: Path | None = None) -> list:
+    init_db(db_path)
+    with closing(get_conn(db_path)) as conn:
+        return conn.execute(
+            "SELECT * FROM registrations WHERE status='blocked' AND expiry_notified=0 "
+            "AND blocked_until <= datetime('now')"
+        ).fetchall()
+
+
+def mark_expiry_notified(reg_id: int, db_path: Path | None = None) -> None:
+    _exec("UPDATE registrations SET expiry_notified=1 WHERE id=?", (reg_id,), db_path)
+
+
+def request_restore(telegram_id: int, db_path: Path | None = None) -> str:
+    """-> 'ok' | 'not_blocked' | 'active' (срок не вышел) | 'already' (обращение уже отправлено)."""
+    reg = get_by_telegram(telegram_id, db_path)
+    if not reg or reg["status"] != "blocked":
+        return "not_blocked"
+    if not is_block_expired(reg, db_path):
+        return "active"
+    if reg["restore_status"] == "requested":
+        return "already"
+    _exec("UPDATE registrations SET restore_status='requested' WHERE id=? AND status='blocked'", (reg["id"],), db_path)
+    return "ok"
+
+
+def decide_restore(reg_id: int, approve: bool, db_path: Path | None = None) -> bool:
+    """Решение админа по обращению. False — уже рассмотрено."""
+    if approve:
+        sql = ("UPDATE registrations SET status='approved', blocked_until=NULL, restore_status=NULL, "
+               "expiry_notified=0 WHERE id=? AND status='blocked' AND restore_status='requested'")
+    else:
+        sql = ("UPDATE registrations SET restore_status='denied' "
+               "WHERE id=? AND status='blocked' AND restore_status='requested'")
+    return _exec(sql, (reg_id,), db_path) == 1

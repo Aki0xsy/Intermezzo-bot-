@@ -9,11 +9,12 @@
 import asyncio
 import html
 import logging
+from datetime import datetime, timezone
 from aiohttp import web
 
 from aiogram import Bot, Dispatcher, F, Router
 from aiogram.enums import ParseMode
-from aiogram.filters import Command, CommandStart, ExceptionTypeFilter, StateFilter
+from aiogram.filters import Command, CommandObject, CommandStart, ExceptionTypeFilter, StateFilter
 from aiogram.fsm.context import FSMContext
 from aiogram.fsm.state import State, StatesGroup
 from aiogram.fsm.storage.base import StorageKey
@@ -89,6 +90,8 @@ def main_menu_kb(user_id: int | None = None) -> InlineKeyboardMarkup:
     reg = storage.get_by_telegram(user_id) if user_id else None
     if reg and reg["status"] == "approved":
         b.button(text="👤 Профиль", callback_data="profile")
+    elif reg and reg["status"] == "blocked":
+        b.button(text="🔒 Аккаунт заблокирован", callback_data="restore_req")
     elif not reg or reg["status"] == "rejected":
         b.button(text="📝 Заполнить заявку", callback_data="start_reg")
     b.button(text="ℹ️ О сервере", callback_data="about_server")
@@ -101,6 +104,34 @@ def admin_kb(reg_id: int) -> InlineKeyboardMarkup:
     b.button(text="✅ Принять", callback_data=f"adm:ok:{reg_id}")
     b.button(text="❌ Отклонить", callback_data=f"adm:no:{reg_id}")
     b.adjust(2)
+    return b.as_markup()
+
+
+def block_kb(reg_id: int) -> InlineKeyboardMarkup:
+    b = InlineKeyboardBuilder()
+    b.button(text="🔒 Заблокировать на 24 ч", callback_data=f"adm:blk:{reg_id}")
+    return b.as_markup()
+
+
+def block_confirm_kb(reg_id: int) -> InlineKeyboardMarkup:
+    b = InlineKeyboardBuilder()
+    b.button(text="⚠️ Да, заблокировать", callback_data=f"adm:blkyes:{reg_id}")
+    b.button(text="↩️ Нет", callback_data=f"adm:blkno:{reg_id}")
+    b.adjust(2)
+    return b.as_markup()
+
+
+def restore_admin_kb(reg_id: int) -> InlineKeyboardMarkup:
+    b = InlineKeyboardBuilder()
+    b.button(text="✅ Восстановить", callback_data=f"rst:ok:{reg_id}")
+    b.button(text="❌ Отказать", callback_data=f"rst:no:{reg_id}")
+    b.adjust(2)
+    return b.as_markup()
+
+
+def restore_kb() -> InlineKeyboardMarkup:
+    b = InlineKeyboardBuilder()
+    b.button(text="📨 Подать заявку на восстановление", callback_data="restore_req")
     return b.as_markup()
 
 
@@ -126,6 +157,22 @@ def cancel_kb() -> ReplyKeyboardMarkup:
     b.button(text="❌ Отмена")
     b.adjust(1)
     return b.as_markup(resize_keyboard=True)
+
+
+def _who(user) -> str:
+    return f"@{user.username}" if user.username else str(user.id)
+
+
+def _parse_utc(value: str) -> datetime:
+    return datetime.strptime(value, "%Y-%m-%d %H:%M:%S").replace(tzinfo=timezone.utc)
+
+
+def _remaining(blocked_until: str) -> str:
+    left = int((_parse_utc(blocked_until) - datetime.now(timezone.utc)).total_seconds())
+    if left <= 0:
+        return "меньше минуты"
+    h, m = left // 3600, (left % 3600) // 60
+    return f"{h} ч {m} мин" if h else f"{m} мин"
 
 
 def _collect(fsm_data: dict) -> dict:
@@ -439,16 +486,14 @@ async def cb_admin_decision(callback: CallbackQuery, bot: Bot, dispatcher: Dispa
         await callback.message.edit_text(
             f"{callback.message.html_text}\n\n<b>{mark}</b> — {_e(who)}",
             parse_mode=ParseMode.HTML,
-            reply_markup=None,
+            reply_markup=block_kb(reg["id"]) if new_status == "approved" else None,
         )
     except Exception as e:  # noqa: BLE001
         log.warning("Не удалось обновить сообщение админа: %s", e)
     await _safe_answer(callback, mark)
 
-    try:
-        await asyncio.to_thread(sheets.update_status_sync, reg["telegram_id"], new_status)
-    except Exception as e:  # noqa: BLE001
-        log.warning("Sheets status update error: %s", e)
+    reviewer = who if new_status == "approved" else f"отклонено: {who}"
+    await sheets.update_row(reg["telegram_id"], {9: new_status, 10: reviewer})
 
     uid = reg["telegram_id"]
     try:
@@ -497,6 +542,7 @@ async def _save_password(message: Message, state: FSMContext, first_time: bool) 
     except Exception:  # noqa: BLE001
         pass
     reg = storage.get_by_telegram(message.from_user.id)
+    await sheets.update_row(message.from_user.id, {11: result})
     try:
         await server.push_password(reg["minecraft_nick"], result)
     except Exception as e:  # noqa: BLE001
@@ -544,6 +590,9 @@ async def cmd_profile(message: Message, state: FSMContext) -> None:
 @router.callback_query(F.data == "profile")
 async def cb_profile(callback: CallbackQuery) -> None:
     reg = storage.get_by_telegram(callback.from_user.id)
+    if reg and reg["status"] == "blocked":
+        await _safe_answer(callback, "Аккаунт заблокирован.", show_alert=True)
+        return
     if not reg or reg["status"] != "approved":
         await _safe_answer(callback, "Профиль появится после одобрения заявки.", show_alert=True)
         return
@@ -573,6 +622,206 @@ async def cb_change_password(callback: CallbackQuery, state: FSMContext) -> None
         reply_markup=cancel_kb(),
     )
     await _safe_answer(callback)
+
+
+# ---------- Блокировка и восстановление ----------
+
+ADMIN_ONLY = F.from_user.id.in_(set(config.ADMIN_IDS))
+
+
+async def _do_block(bot: Bot, reg, admin) -> str | None:
+    """Блокирует аккаунт на 24 ч. Возвращает «до …» (UTC) или None, если блокировать нельзя."""
+    if not storage.block(reg["id"], admin.id, hours=24):
+        return None
+    fresh = storage.get_by_id(reg["id"])
+    until = fresh["blocked_until"]
+    await sheets.update_row(reg["telegram_id"], {9: "blocked", 12: f"до {until} UTC ({_who(admin)})"})
+    try:
+        await server.set_blocked(reg["minecraft_nick"], True)
+    except Exception as e:  # noqa: BLE001
+        log.warning("server.set_blocked failed: %s", e)
+    try:
+        await bot.send_message(
+            reg["telegram_id"],
+            "🔒 <b>Твой аккаунт заблокирован администрацией на 24 часа.</b>\n\n"
+            "Когда срок закончится, я напишу тебе, и ты сможешь подать заявку на восстановление.",
+            parse_mode=ParseMode.HTML,
+            reply_markup=main_menu_kb(reg["telegram_id"]),
+        )
+    except Exception as e:  # noqa: BLE001
+        log.warning("Не удалось уведомить игрока %s о блокировке: %s", reg["telegram_id"], e)
+    return until
+
+
+@router.callback_query(F.data.regexp(r"^adm:(blk|blkyes|blkno):\d+$"))
+async def cb_admin_block(callback: CallbackQuery, bot: Bot) -> None:
+    if callback.from_user.id not in config.ADMIN_IDS:
+        await _safe_answer(callback, "Только для администраторов.", show_alert=True)
+        return
+    _, action, reg_id_s = callback.data.split(":")
+    reg = storage.get_by_id(int(reg_id_s))
+    if not reg:
+        await _safe_answer(callback, "Заявка не найдена.", show_alert=True)
+        return
+    if action == "blk":      # шаг 1: просим подтвердить, чтобы не заблокировать случайным тапом
+        await callback.message.edit_reply_markup(reply_markup=block_confirm_kb(reg["id"]))
+        await _safe_answer(callback)
+        return
+    if action == "blkno":
+        await callback.message.edit_reply_markup(reply_markup=block_kb(reg["id"]))
+        await _safe_answer(callback)
+        return
+    until = await _do_block(bot, reg, callback.from_user)
+    if until is None:
+        await _safe_answer(callback, "Аккаунт сейчас нельзя заблокировать (уже заблокирован?).", show_alert=True)
+        await callback.message.edit_reply_markup(reply_markup=None)
+        return
+    try:
+        await callback.message.edit_text(
+            f"{callback.message.html_text}\n\n<b>🔒 Заблокирован на 24 ч</b> (до {until} UTC) — {_e(_who(callback.from_user))}",
+            parse_mode=ParseMode.HTML,
+            reply_markup=None,
+        )
+    except Exception as e:  # noqa: BLE001
+        log.warning("Не удалось обновить сообщение админа: %s", e)
+    await _safe_answer(callback, "Заблокирован")
+
+
+@router.message(Command("block"), ADMIN_ONLY)
+async def cmd_block(message: Message, command: CommandObject, bot: Bot) -> None:
+    nick = (command.args or "").strip().lstrip("@")
+    reg = storage.get_by_nick(nick) if nick else None
+    if not reg:
+        await message.answer("Использование: /block <ник Minecraft>\nИгрок с таким ником не найден.")
+        return
+    until = await _do_block(bot, reg, message.from_user)
+    await message.answer(
+        f"🔒 {_e(reg['minecraft_nick'])} заблокирован до {until} UTC." if until
+        else f"Нельзя заблокировать: статус {_e(reg['status'])} (блокируются только одобренные)."
+    )
+
+
+@router.message(Command("unblock"), ADMIN_ONLY)
+async def cmd_unblock(message: Message, command: CommandObject, bot: Bot) -> None:
+    nick = (command.args or "").strip().lstrip("@")
+    reg = storage.get_by_nick(nick) if nick else None
+    if not reg or not storage.unblock(reg["id"]):
+        await message.answer("Использование: /unblock <ник Minecraft>\nЗаблокированный игрок с таким ником не найден.")
+        return
+    await sheets.update_row(reg["telegram_id"], {9: "approved", 12: f"снята вручную ({_who(message.from_user)})"})
+    try:
+        await server.set_blocked(reg["minecraft_nick"], False)
+    except Exception as e:  # noqa: BLE001
+        log.warning("server.set_blocked failed: %s", e)
+    try:
+        await bot.send_message(reg["telegram_id"], "🔓 Блокировка снята администратором.",
+                               reply_markup=main_menu_kb(reg["telegram_id"]))
+    except Exception as e:  # noqa: BLE001
+        log.warning("Не удалось уведомить игрока: %s", e)
+    await message.answer(f"🔓 {_e(reg['minecraft_nick'])} разблокирован.")
+
+
+@router.callback_query(F.data == "restore_req")
+async def cb_restore_req(callback: CallbackQuery, bot: Bot) -> None:
+    uid = callback.from_user.id
+    result = storage.request_restore(uid)
+    reg = storage.get_by_telegram(uid)
+    if result == "not_blocked":
+        await _safe_answer(callback, "Твой аккаунт не заблокирован.", show_alert=True)
+        return
+    if result == "active":
+        await _safe_answer(callback, f"Блокировка ещё действует: осталось {_remaining(reg['blocked_until'])}.", show_alert=True)
+        return
+    if result == "already":
+        await _safe_answer(callback, "Обращение уже отправлено. Ждём решения администрации.", show_alert=True)
+        return
+    text = (
+        "📨 <b>Обращение: заявка на восстановление</b>\n\n"
+        f"⛏️ Ник: <b>{_e(reg['minecraft_nick'])}</b>\n"
+        f"Telegram: {_e('@' + reg['telegram_username'] if reg['telegram_username'] else uid)} (id={uid})\n"
+        f"Заблокировал: {_e(reg['blocked_by'])}\n"
+        "Срок блокировки (24 ч) истёк."
+    )
+    delivered = 0
+    for admin_id in config.ADMIN_IDS:
+        try:
+            await bot.send_message(admin_id, text, parse_mode=ParseMode.HTML, reply_markup=restore_admin_kb(reg["id"]))
+            delivered += 1
+        except Exception as e:  # noqa: BLE001
+            log.warning("Не удалось отправить обращение админу %s: %s", admin_id, e)
+    await _safe_answer(callback, "Обращение отправлено!")
+    await callback.message.answer(
+        "📨 Обращение отправлено администрации. Как только его рассмотрят — я напишу тебе."
+        if delivered else "⚠️ Не удалось доставить обращение админам. Попробуй позже.",
+    )
+
+
+@router.callback_query(F.data.regexp(r"^rst:(ok|no):\d+$"))
+async def cb_restore_decision(callback: CallbackQuery, bot: Bot) -> None:
+    if callback.from_user.id not in config.ADMIN_IDS:
+        await _safe_answer(callback, "Только для администраторов.", show_alert=True)
+        return
+    _, action, reg_id_s = callback.data.split(":")
+    reg = storage.get_by_id(int(reg_id_s))
+    approve = action == "ok"
+    if not reg or not storage.decide_restore(reg["id"], approve):
+        await _safe_answer(callback, "Обращение уже рассмотрено.", show_alert=True)
+        try:
+            await callback.message.edit_reply_markup(reply_markup=None)
+        except Exception:  # noqa: BLE001
+            pass
+        return
+    who = _who(callback.from_user)
+    mark = "✅ Доступ восстановлен" if approve else "❌ В восстановлении отказано"
+    try:
+        await callback.message.edit_text(
+            f"{callback.message.html_text}\n\n<b>{mark}</b> — {_e(who)}",
+            parse_mode=ParseMode.HTML, reply_markup=None,
+        )
+    except Exception as e:  # noqa: BLE001
+        log.warning("Не удалось обновить сообщение админа: %s", e)
+    await _safe_answer(callback, mark)
+
+    if approve:
+        await sheets.update_row(reg["telegram_id"], {9: "approved", 12: f"восстановлен ({who})"})
+        try:
+            await server.set_blocked(reg["minecraft_nick"], False)
+        except Exception as e:  # noqa: BLE001
+            log.warning("server.set_blocked failed: %s", e)
+    else:
+        await sheets.update_row(reg["telegram_id"], {12: f"в восстановлении отказано ({who})"})
+    try:
+        await bot.send_message(
+            reg["telegram_id"],
+            "✅ <b>Доступ восстановлен!</b> Профиль снова доступен." if approve
+            else "❌ В восстановлении доступа отказано. Ты можешь отправить новое обращение.",
+            parse_mode=ParseMode.HTML,
+            reply_markup=main_menu_kb(reg["telegram_id"]),
+        )
+    except Exception as e:  # noqa: BLE001
+        log.warning("Не удалось уведомить игрока %s: %s", reg["telegram_id"], e)
+
+
+async def _expiry_notifier(bot: Bot) -> None:
+    """Раз в минуту: у кого закончилась блокировка — предлагаем подать заявку на восстановление."""
+    while True:
+        try:
+            for reg in await asyncio.to_thread(storage.due_expiry_notifications):
+                try:
+                    await bot.send_message(
+                        reg["telegram_id"],
+                        "⏰ <b>Срок блокировки закончился.</b>\n\n"
+                        "Чтобы вернуть доступ, подай заявку на восстановление — "
+                        "обращение уйдёт администрации.",
+                        parse_mode=ParseMode.HTML,
+                        reply_markup=restore_kb(),
+                    )
+                except Exception as e:  # noqa: BLE001
+                    log.warning("Не удалось отправить уведомление %s: %s", reg["telegram_id"], e)
+                await asyncio.to_thread(storage.mark_expiry_notified, reg["id"])
+        except Exception:  # noqa: BLE001
+            log.exception("expiry notifier error")
+        await asyncio.sleep(60)
 
 
 @router.callback_query()
@@ -621,6 +870,7 @@ async def main() -> None:
             log.warning("Sheets init warning: %s", e)
 
     bot = Bot(token=config.BOT_TOKEN)
+    notifier = asyncio.create_task(_expiry_notifier(bot))
 
     # FSM поверх SQLite — переживает рестарт контейнера (если data/ лежит на volume).
     dp = Dispatcher(storage=SQLiteStorage(storage.DB_PATH.parent / "fsm.db"))
@@ -656,6 +906,7 @@ async def main() -> None:
             await asyncio.Event().wait()
         finally:
             await runner.cleanup()
+            notifier.cancel()
             await bot.session.close()
     else:
         log.info("Бот запущен (polling).")
@@ -663,6 +914,7 @@ async def main() -> None:
             await bot.delete_webhook(drop_pending_updates=True)
             await dp.start_polling(bot)
         finally:
+            notifier.cancel()
             await bot.session.close()
 
 

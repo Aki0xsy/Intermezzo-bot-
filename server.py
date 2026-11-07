@@ -16,3 +16,8 @@ async def is_online(nick: str) -> bool | None:
 async def push_password(nick: str, password: str) -> bool:
     """Передать пароль плагину (когда он появится). Сейчас ничего не делает."""
     return False
+
+
+async def set_blocked(nick: str, blocked: bool) -> bool:
+    """Заблокировать/разблокировать вход игрока на сервере (когда появится плагин)."""
+    return False
