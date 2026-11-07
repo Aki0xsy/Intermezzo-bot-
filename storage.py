@@ -221,3 +221,41 @@ def decide_restore(reg_id: int, approve: bool, db_path: Path | None = None) -> b
         sql = ("UPDATE registrations SET restore_status='denied' "
                "WHERE id=? AND status='blocked' AND restore_status='requested'")
     return _exec(sql, (reg_id,), db_path) == 1
+
+
+def restore_from_rows(rows: list[list[str]], db_path: Path | None = None) -> int:
+    """Восстанавливает заявки из строк Google-таблицы (если база на Railway сбросилась).
+    Добавляет только тех, кого в базе нет (по Telegram ID и нику). Отклонённых пропускает.
+    Колонки: 0 дата, 1 имя, 2 возраст, 3 страна, 4 ник MC, 5 Discord, 6 Telegram ID,
+    7 Telegram, 8 статус, 9 принял, 10 пароль, 11 блокировка."""
+    init_db(db_path)
+    latest: dict[int, list[str]] = {}
+    for row in rows:
+        row = list(row) + [""] * (12 - len(row))
+        if row[6].strip().isdigit():
+            latest[int(row[6].strip())] = row  # при нескольких строках берётся последняя
+    added = 0
+    with closing(get_conn(db_path)) as conn:
+        for tg_id, row in latest.items():
+            status = row[8].strip().lower()
+            if status not in ("pending", "approved", "blocked"):
+                continue
+            try:
+                age = int(row[2].strip())
+            except ValueError:
+                continue
+            blocked_until = "datetime('now')" if status == "blocked" else "NULL"
+            try:
+                cur = conn.execute(
+                    f"""INSERT OR IGNORE INTO registrations
+                        (telegram_id, telegram_username, name, age, country, minecraft_nick,
+                         discord_nick, status, password, reviewed_by, blocked_until, expiry_notified)
+                        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, {blocked_until}, 0)""",
+                    (tg_id, row[7].strip().lstrip("@") or None, row[1].strip(), age, row[3].strip(),
+                     row[4].strip(), row[5].strip(), status, row[10] or None, row[9].strip() or None),
+                )
+                added += cur.rowcount
+            except sqlite3.IntegrityError:
+                continue
+        conn.commit()
+    return added

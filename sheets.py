@@ -117,6 +117,21 @@ def ensure_header_sync() -> bool:
         return False
 
 
+def fetch_rows_sync() -> list[list[str]]:
+    """Все строки листа без шапки (для восстановления базы)."""
+    if not config.GOOGLE_SHEETS_ID:
+        return []
+    try:
+        client = _get_client()
+        if client is None:
+            return []
+        ws = _resolve_worksheet(client.open_by_key(config.GOOGLE_SHEETS_ID))
+        return ws.get_all_values()[1:]
+    except Exception as e:  # noqa: BLE001
+        log.warning("Google Sheets fetch failed: %s", e)
+        return []
+
+
 def update_row_sync(telegram_id: int, values: dict[int, str]) -> bool:
     """Обновляет ячейки в строке игрока (поиск по Telegram ID в 7-й колонке; если строк
     несколько — берётся последняя). values: {номер_колонки: значение}. Колонки: 9 — Статус,

@@ -869,6 +869,13 @@ async def main() -> None:
             await asyncio.to_thread(sheets.ensure_header_sync)
         except Exception as e:  # noqa: BLE001
             log.warning("Sheets init warning: %s", e)
+        try:  # база на Railway без volume стирается при redeploy — поднимаем игроков из таблицы
+            rows = await asyncio.to_thread(sheets.fetch_rows_sync)
+            restored = await asyncio.to_thread(storage.restore_from_rows, rows)
+            if restored:
+                log.warning("Восстановлено из Google Sheets: %s игроков", restored)
+        except Exception as e:  # noqa: BLE001
+            log.warning("Sheets restore warning: %s", e)
 
     bot = Bot(token=config.BOT_TOKEN)
     notifier = asyncio.create_task(_expiry_notifier(bot))
