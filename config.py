@@ -28,3 +28,6 @@ GOOGLE_SHEET_NAME = os.getenv("GOOGLE_SHEET_NAME", "Sheet1").strip() or "Sheet1"
 GOOGLE_SERVICE_ACCOUNT_JSON = os.getenv("GOOGLE_SERVICE_ACCOUNT_JSON", "").strip()
 GOOGLE_SERVICE_ACCOUNT_FILE = os.getenv("GOOGLE_SERVICE_ACCOUNT_FILE", "").strip()
 SHEET_HEADER = ["Дата", "Имя", "Возраст", "Страна", "Ник Minecraft", "Ник Discord", "Telegram ID", "Telegram", "Статус", "Принял (админ)", "Пароль", "Блокировка"]
+# --- API для серверного мода (Minecraft) ---
+# Общий секрет бота и мода. Пусто = API выключен.
+PLUGIN_API_TOKEN = os.getenv("PLUGIN_API_TOKEN", "").strip()

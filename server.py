@@ -6,11 +6,14 @@ is_online(nick) -> True / False / None (None = статус неизвестен
 """
 import logging
 
+import api
+
 log = logging.getLogger(__name__)
 
 
 async def is_online(nick: str) -> bool | None:
-    return None
+    """Данные присылает мод (api.py). None — мод давно не выходил на связь."""
+    return api.is_online(nick)
 
 
 async def push_password(nick: str, password: str) -> bool:

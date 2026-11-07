@@ -30,6 +30,7 @@ from aiogram.types.error_event import ErrorEvent
 from aiogram.utils.keyboard import InlineKeyboardBuilder, ReplyKeyboardBuilder
 from aiogram.webhook.aiohttp_server import SimpleRequestHandler, setup_application
 
+import api
 import config
 import sheets
 import server
@@ -889,6 +890,7 @@ async def main() -> None:
         app = web.Application()
         app.router.add_get("/health", health)
         app.router.add_get("/", health)
+        api.register(app)
         # SimpleRequestHandler проверяет секрет, сразу отвечает 200 и обрабатывает апдейт
         # в фоне — ошибки хендлеров не превращаются в 500 и бесконечные ретраи Telegram.
         SimpleRequestHandler(
@@ -910,10 +912,21 @@ async def main() -> None:
             await bot.session.close()
     else:
         log.info("Бот запущен (polling).")
+        api_runner = None
+        if config.PLUGIN_API_TOKEN:  # в polling-режиме веб-сервер нужен только для API мода
+            api_app = web.Application()
+            api_app.router.add_get("/health", health)
+            api.register(api_app)
+            api_runner = web.AppRunner(api_app)
+            await api_runner.setup()
+            await web.TCPSite(api_runner, "0.0.0.0", config.PORT).start()
+            log.info("API для мода слушает порт %s", config.PORT)
         try:
             await bot.delete_webhook(drop_pending_updates=True)
             await dp.start_polling(bot)
         finally:
+            if api_runner:
+                await api_runner.cleanup()
             notifier.cancel()
             await bot.session.close()
 
