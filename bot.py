@@ -100,6 +100,10 @@ def cancel_kb() -> ReplyKeyboardMarkup:
     return b.as_markup(resize_keyboard=True)
 
 
+def _collect(fsm_data: dict) -> dict:
+    return {f: fsm_data[f] for f in STEP_FIELDS if f in fsm_data}
+
+
 async def _safe_answer(callback: CallbackQuery, text: str | None = None, show_alert: bool = False) -> None:
     """callback.answer() падает с 'query is too old' — это не повод ронять хендлер."""
     try:
@@ -232,7 +236,7 @@ async def cb_cancel(callback: CallbackQuery, state: FSMContext) -> None:
 async def _begin_registration(message: Message, state: FSMContext) -> None:
     await state.clear()
     await state.set_state(RegStates.name)
-    await state.update_data(step_index=0, data={})
+    await state.update_data(step_index=0)
     _, title, hint, _ = STEPS[0]
     await message.answer(
         f"{title}\n\n{hint}\n\nОтмена — /cancel",
@@ -285,10 +289,10 @@ async def handle_answer(message: Message, state: FSMContext) -> None:
         )
         return
 
-    fsm_data = await state.get_data()
-    data: dict = fsm_data.get("data", {})
-    data[field] = result
-    await state.update_data(data=data)
+    # ВАЖНО: update_data(data=...) попадает в позиционный параметр data, а не в kwargs,
+    # поэтому поля храним плоско: {name:..., age:...}.
+    await state.update_data({field: result})
+    data = _collect(await state.get_data())
     log.info("FSM save: %s (%s)", field, list(data.keys()))
 
     next_index = step_index + 1
@@ -296,7 +300,6 @@ async def handle_answer(message: Message, state: FSMContext) -> None:
         await _ask_step(message, state, next_index)
     else:
         await state.set_state(RegStates.confirm)
-        await state.update_data(data=data)
         log.info("FSM confirm: %s", list(data.keys()))
         await message.answer(
             format_summary(data),
@@ -307,8 +310,7 @@ async def handle_answer(message: Message, state: FSMContext) -> None:
 
 @router.callback_query(F.data == "confirm_reg", StateFilter(RegStates.confirm))
 async def cb_confirm(callback: CallbackQuery, state: FSMContext, bot: Bot) -> None:
-    fsm_data = await state.get_data()
-    data: dict = fsm_data.get("data", {})
+    data = _collect(await state.get_data())
     log.info("FSM confirm data: %s", list(data.keys()))
 
     if storage.check_duplicate_telegram(callback.from_user.id):
