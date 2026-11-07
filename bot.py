@@ -407,14 +407,35 @@ async def main() -> None:
         app = web.Application()
         app.router.add_get("/health", health)
         app.router.add_get("/", health)
-        await dp.webhook(app, config.WEBHOOK_PATH)
+        # aiogram >=3: Dispatcher.webhook нет, используем ручную регистрацию
+        webhook_app = None
+        try:
+            from aiogram.webhook.aiohttp_server import SimpleRequestHandler as AiohttpWebhookHandler
+            webhook_app = None  # не нужен, используем feed_webhook_update напрямую
+            async def _webhook_handler(request: web.Request):
+                try:
+                    data = await request.json()
+                except Exception:
+                    return web.Response(status=400)
+                await dp.feed_webhook_update(bot, data)
+                return web.Response(status=200)
+            app.router.add_post(config.WEBHOOK_PATH, _webhook_handler)
+        except ImportError:
+            # Старый aiogram: dp.webhook существует
+            await dp.webhook(app, config.WEBHOOK_PATH)  # type: ignore
         runner = web.AppRunner(app)
         await runner.setup()
         site = web.TCPSite(runner, "0.0.0.0", config.PORT)
         await site.start()
         log.info("Webhook-сервер слушает порт %s", config.PORT)
-        # Держим процесс живым
-        await asyncio.Event().wait()
+        try:
+            await asyncio.Event().wait()
+        finally:
+            await runner.cleanup()
+            try:
+                await bot.session.close()
+            except Exception:
+                pass
     else:
         log.info("Бот запущен (polling).")
         await bot.delete_webhook(drop_pending_updates=True)
