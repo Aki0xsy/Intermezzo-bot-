@@ -7,13 +7,13 @@
 при каждом redeploy/краше, и кнопка подтверждения уходит в "Сессия устарела".
 """
 import asyncio
+import html
 import logging
-import os
 from aiohttp import web
 
 from aiogram import Bot, Dispatcher, F, Router
 from aiogram.enums import ParseMode
-from aiogram.filters import Command, CommandStart, StateFilter
+from aiogram.filters import Command, CommandStart, ExceptionTypeFilter, StateFilter
 from aiogram.fsm.context import FSMContext
 from aiogram.fsm.state import State, StatesGroup
 from aiogram.types import (
@@ -24,11 +24,14 @@ from aiogram.types import (
     ReplyKeyboardMarkup,
     ReplyKeyboardRemove,
 )
+from aiogram.types.error_event import ErrorEvent
 from aiogram.utils.keyboard import InlineKeyboardBuilder, ReplyKeyboardBuilder
+from aiogram.webhook.aiohttp_server import SimpleRequestHandler, setup_application
 
 import config
 import sheets
 import storage
+from fsm_storage import SQLiteStorage
 from validators import (
     validate_age,
     validate_country,
@@ -97,27 +100,39 @@ def cancel_kb() -> ReplyKeyboardMarkup:
     return b.as_markup(resize_keyboard=True)
 
 
+async def _safe_answer(callback: CallbackQuery, text: str | None = None, show_alert: bool = False) -> None:
+    """callback.answer() падает с 'query is too old' — это не повод ронять хендлер."""
+    try:
+        await callback.answer(text, show_alert=show_alert)
+    except Exception as e:  # noqa: BLE001
+        log.debug("callback.answer failed: %s", e)
+
+
+def _e(value) -> str:
+    return html.escape(str(value), quote=False)
+
+
 def format_summary(data: dict) -> str:
     return (
         "📋 <b>Проверь данные:</b>\n\n"
-        f"{FIELD_LABELS['name']}: <b>{data.get('name','—')}</b>\n"
-        f"{FIELD_LABELS['age']}: <b>{data.get('age','—')}</b>\n"
-        f"{FIELD_LABELS['country']}: <b>{data.get('country','—')}</b>\n"
-        f"{FIELD_LABELS['minecraft_nick']}: <b>{data.get('minecraft_nick','—')}</b>\n"
-        f"{FIELD_LABELS['discord_nick']}: <b>{data.get('discord_nick','—')}</b>\n\n"
+        f"{FIELD_LABELS['name']}: <b>{_e(data.get('name','—'))}</b>\n"
+        f"{FIELD_LABELS['age']}: <b>{_e(data.get('age','—'))}</b>\n"
+        f"{FIELD_LABELS['country']}: <b>{_e(data.get('country','—'))}</b>\n"
+        f"{FIELD_LABELS['minecraft_nick']}: <b>{_e(data.get('minecraft_nick','—'))}</b>\n"
+        f"{FIELD_LABELS['discord_nick']}: <b>{_e(data.get('discord_nick','—'))}</b>\n\n"
         "Если всё верно — нажимай «✅ Всё верно»."
     )
 
 
 def format_admin_message(data: dict, tg_id: int, tg_username: str | None) -> str:
-    user_line = f"@{tg_username}" if tg_username else str(tg_id)
+    user_line = _e(f"@{tg_username}" if tg_username else str(tg_id))
     return (
         f"🆕 <b>Новая заявка!</b>\n\n"
-        f"{FIELD_LABELS['name']}: <b>{data.get('name','—')}</b>\n"
-        f"{FIELD_LABELS['age']}: <b>{data.get('age','—')}</b>\n"
-        f"{FIELD_LABELS['country']}: <b>{data.get('country','—')}</b>\n"
-        f"{FIELD_LABELS['minecraft_nick']}: <b>{data.get('minecraft_nick','—')}</b>\n"
-        f"{FIELD_LABELS['discord_nick']}: <b>{data.get('discord_nick','—')}</b>\n"
+        f"{FIELD_LABELS['name']}: <b>{_e(data.get('name','—'))}</b>\n"
+        f"{FIELD_LABELS['age']}: <b>{_e(data.get('age','—'))}</b>\n"
+        f"{FIELD_LABELS['country']}: <b>{_e(data.get('country','—'))}</b>\n"
+        f"{FIELD_LABELS['minecraft_nick']}: <b>{_e(data.get('minecraft_nick','—'))}</b>\n"
+        f"{FIELD_LABELS['discord_nick']}: <b>{_e(data.get('discord_nick','—'))}</b>\n"
         f"Telegram: {user_line} (id={tg_id})\n"
         f"Статус: pending"
     )
@@ -191,27 +206,27 @@ async def cb_about(callback: CallbackQuery) -> None:
         reply_markup=main_menu_kb(),
         parse_mode=ParseMode.HTML,
     )
-    await callback.answer()
+    await _safe_answer(callback)
 
 
 @router.callback_query(F.data == "start_reg")
 async def cb_start_reg(callback: CallbackQuery, state: FSMContext) -> None:
     await _begin_registration(callback.message, state)
-    await callback.answer()
+    await _safe_answer(callback)
 
 
 @router.callback_query(F.data == "restart_reg")
 async def cb_restart(callback: CallbackQuery, state: FSMContext) -> None:
     await state.clear()
     await _begin_registration(callback.message, state)
-    await callback.answer()
+    await _safe_answer(callback)
 
 
 @router.callback_query(F.data == "cancel_reg")
 async def cb_cancel(callback: CallbackQuery, state: FSMContext) -> None:
     await state.clear()
     await callback.message.answer("❌ Заявка отменена.", reply_markup=main_menu_kb())
-    await callback.answer()
+    await _safe_answer(callback)
 
 
 async def _begin_registration(message: Message, state: FSMContext) -> None:
@@ -220,7 +235,7 @@ async def _begin_registration(message: Message, state: FSMContext) -> None:
     await state.update_data(step_index=0, data={})
     _, title, hint, _ = STEPS[0]
     await message.answer(
-        f"{title}\n\n{hint}\n\n_Отмена — /cancel_",
+        f"{title}\n\n{hint}\n\nОтмена — /cancel",
         reply_markup=cancel_kb(),
         parse_mode=ParseMode.HTML,
     )
@@ -231,7 +246,7 @@ async def _ask_step(message: Message, state: FSMContext, step_index: int) -> Non
     await state.set_state(getattr(RegStates, field))
     await state.update_data(step_index=step_index)
     await message.answer(
-        f"{title}\n\n{hint}\n\n_Отмена — /cancel_",
+        f"{title}\n\n{hint}\n\nОтмена — /cancel",
         reply_markup=cancel_kb(),
         parse_mode=ParseMode.HTML,
     )
@@ -302,7 +317,7 @@ async def cb_confirm(callback: CallbackQuery, state: FSMContext, bot: Bot) -> No
             reply_markup=main_menu_kb(),
         )
         await state.clear()
-        await callback.answer()
+        await _safe_answer(callback)
         return
     if storage.check_duplicate_minecraft_nick(data.get("minecraft_nick", "")):
         await callback.message.answer(
@@ -310,14 +325,14 @@ async def cb_confirm(callback: CallbackQuery, state: FSMContext, bot: Bot) -> No
             reply_markup=main_menu_kb(),
         )
         await state.clear()
-        await callback.answer()
+        await _safe_answer(callback)
         return
 
     required = ("name", "age", "country", "minecraft_nick", "discord_nick")
     if any(not str(data.get(field, "")).strip() for field in required):
         log.warning("Incomplete data in confirm: %s", data)
         await state.clear()
-        await callback.answer("Сессия заявки устарела", show_alert=True)
+        await _safe_answer(callback, "Сессия заявки устарела", show_alert=True)
         await callback.message.answer(
             "⚠️ Сессия заявки устарела.\n\nНачни регистрацию заново: нажми «📝 Заполнить заявку».",
             reply_markup=main_menu_kb(),
@@ -331,11 +346,11 @@ async def cb_confirm(callback: CallbackQuery, state: FSMContext, bot: Bot) -> No
     )
     if not ok:
         await callback.message.answer(f"❌ Не удалось сохранить: {msg}", reply_markup=main_menu_kb())
-        await callback.answer()
+        await _safe_answer(callback)
         return
 
     await state.clear()
-    await callback.answer("Заявка отправлена!")
+    await _safe_answer(callback, "Заявка отправлена!")
     await callback.message.answer(
         "🎉 <b>Заявка отправлена!</b>\n\n"
         f"{format_summary(data)}\n\n"
@@ -360,6 +375,27 @@ async def cb_confirm(callback: CallbackQuery, state: FSMContext, bot: Bot) -> No
             await bot.send_message(admin_id, admin_text, parse_mode=ParseMode.HTML)
         except Exception as e:  # noqa: BLE001 — не падаем, если админ заблокировал бота
             log.warning("Не удалось отправить админу %s: %s", admin_id, e)
+
+
+@router.callback_query()
+async def stale_callback(callback: CallbackQuery) -> None:
+    """Любая кнопка, для которой нет состояния (старое сообщение, рестарт, двойной клик)."""
+    await _safe_answer(callback, "Сессия устарела. Нажми /start", show_alert=True)
+
+
+@router.error(ExceptionTypeFilter(Exception))
+async def on_error(event: ErrorEvent) -> bool:
+    """Глобальный перехват: логируем и вежливо отвечаем, а не оставляем пользователя в тишине."""
+    log.exception("Ошибка при обработке апдейта: %s", event.exception)
+    update = event.update
+    try:
+        if update.callback_query:
+            await _safe_answer(update.callback_query, "Что-то пошло не так, попробуй ещё раз.", show_alert=True)
+        elif update.message:
+            await update.message.answer("⚠️ Что-то пошло не так. Попробуй ещё раз или нажми /start.")
+    except Exception:  # noqa: BLE001
+        log.warning("Не удалось сообщить пользователю об ошибке")
+    return True
 
 
 @router.message()
@@ -388,85 +424,8 @@ async def main() -> None:
 
     bot = Bot(token=config.BOT_TOKEN)
 
-    # FSM поверх SQLite — переживает redeploy и рестарт контейнера.
-    # На Railway volume /app/data/fsm.db (там же data/registrations.db).
-    from aiogram.fsm.storage.base import StorageKey
-
-    import asyncio as _asyncio
-
-    class DiskFSMStorage:
-        """Мини-хранилище поверх sqlite3: state + data на каждый (chat_id, user_id)."""
-        def __init__(self, path):
-            self.path = path
-            import sqlite3
-            self._sql = sqlite3
-
-        def _conn(self):
-            self.path.parent.mkdir(parents=True, exist_ok=True)
-            c = self._sql.connect(str(self.path))
-            c.execute("""CREATE TABLE IF NOT EXISTS fsm (
-                chat_id INTEGER, user_id INTEGER,
-                state TEXT, data TEXT,
-                PRIMARY KEY(chat_id, user_id)
-            )""")
-            c.commit()
-            return c
-
-        async def get_state(self, key: StorageKey):
-            return await _asyncio.to_thread(self._get_state, key)
-
-        def _get_state(self, key):
-            with self._conn() as c:
-                row = c.execute("SELECT state FROM fsm WHERE chat_id=? AND user_id=?",
-                                (key.chat_id, key.user_id)).fetchone()
-                return row[0] if row else None
-
-        async def set_state(self, key: StorageKey, state=None):
-            return await _asyncio.to_thread(self._set_state, key, state)
-
-        def _set_state(self, key, state):
-            with self._conn() as c:
-                c.execute("""INSERT INTO fsm (chat_id, user_id, state, data)
-                    VALUES (?, ?, ?, COALESCE((SELECT data FROM fsm WHERE chat_id=? AND user_id=?), '{}'))
-                    ON CONFLICT(chat_id, user_id) DO UPDATE SET state=excluded.state""",
-                    (key.chat_id, key.user_id, state, key.chat_id, key.user_id))
-                c.commit()
-
-        async def get_data(self, key: StorageKey):
-            return await _asyncio.to_thread(self._get_data, key)
-
-        def _get_data(self, key):
-            import json
-            with self._conn() as c:
-                row = c.execute("SELECT data FROM fsm WHERE chat_id=? AND user_id=?",
-                                (key.chat_id, key.user_id)).fetchone()
-                if not row or not row[0]:
-                    return {}
-                try:
-                    return json.loads(row[0])
-                except Exception:
-                    return {}
-
-        async def set_data(self, key: StorageKey, data: dict):
-            return await _asyncio.to_thread(self._set_data, key, data)
-
-        def _set_data(self, key, data):
-            import json
-            with self._conn() as c:
-                c.execute("""INSERT INTO fsm (chat_id, user_id, state, data)
-                    VALUES (?, ?, NULL, ?)
-                    ON CONFLICT(chat_id, user_id) DO UPDATE SET data=excluded.data""",
-                    (key.chat_id, key.user_id, json.dumps(data, ensure_ascii=False)))
-                c.commit()
-
-        async def close(self):
-            pass
-
-    from pathlib import Path as _P
-    fsm_path = _P(__file__).parent / "data" / "fsm.db"
-
-    storage_engine = DiskFSMStorage(fsm_path)
-    dp = Dispatcher(storage=storage_engine)
+    # FSM поверх SQLite — переживает рестарт контейнера (если data/ лежит на volume).
+    dp = Dispatcher(storage=SQLiteStorage(storage.DB_PATH.parent / "fsm.db"))
     dp.include_router(router)
 
     if config.USE_WEBHOOK:
@@ -482,18 +441,14 @@ async def main() -> None:
         app = web.Application()
         app.router.add_get("/health", health)
         app.router.add_get("/", health)
-        try:
-            from aiogram.webhook.aiohttp_server import SimpleRequestHandler
-            async def _webhook_handler(request: web.Request):
-                try:
-                    data = await request.json()
-                except Exception:
-                    return web.Response(status=400)
-                await dp.feed_webhook_update(bot, data)
-                return web.Response(status=200)
-            app.router.add_post(config.WEBHOOK_PATH, _webhook_handler)
-        except ImportError:
-            await dp.webhook(app, config.WEBHOOK_PATH)  # type: ignore
+        # SimpleRequestHandler проверяет секрет, сразу отвечает 200 и обрабатывает апдейт
+        # в фоне — ошибки хендлеров не превращаются в 500 и бесконечные ретраи Telegram.
+        SimpleRequestHandler(
+            dispatcher=dp,
+            bot=bot,
+            secret_token=config.WEBHOOK_SECRET or None,
+        ).register(app, path=config.WEBHOOK_PATH)
+        setup_application(app, dp, bot=bot)
         runner = web.AppRunner(app)
         await runner.setup()
         site = web.TCPSite(runner, "0.0.0.0", config.PORT)
@@ -503,14 +458,14 @@ async def main() -> None:
             await asyncio.Event().wait()
         finally:
             await runner.cleanup()
-            try:
-                await bot.session.close()
-            except Exception:
-                pass
+            await bot.session.close()
     else:
         log.info("Бот запущен (polling).")
-        await bot.delete_webhook(drop_pending_updates=True)
-        await dp.start_polling(bot)
+        try:
+            await bot.delete_webhook(drop_pending_updates=True)
+            await dp.start_polling(bot)
+        finally:
+            await bot.session.close()
 
 
 if __name__ == "__main__":

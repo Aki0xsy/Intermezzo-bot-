@@ -1,21 +1,24 @@
 """Простое хранилище заявок на SQLite. Без внешних зависимостей."""
 import json
+import os
 import sqlite3
+from contextlib import closing
 from pathlib import Path
 
-DB_PATH = Path(__file__).parent / "data" / "registrations.db"
+# DATA_DIR можно вынести на Railway volume (например /data), иначе ./data
+DB_PATH = Path(os.getenv("DATA_DIR") or Path(__file__).parent / "data") / "registrations.db"
 
 
 def get_conn(db_path: Path | None = None) -> sqlite3.Connection:
     path = db_path or DB_PATH
     path.parent.mkdir(parents=True, exist_ok=True)
-    conn = sqlite3.connect(str(path))
+    conn = sqlite3.connect(str(path), timeout=15)
     conn.row_factory = sqlite3.Row
     return conn
 
 
 def init_db(db_path: Path | None = None) -> None:
-    with get_conn(db_path) as conn:
+    with closing(get_conn(db_path)) as conn:
         conn.execute(
             """
             CREATE TABLE IF NOT EXISTS registrations (
@@ -45,7 +48,7 @@ def save_application(
     """Сохраняет заявку. Возвращает (ok, сообщение)."""
     init_db(db_path)
     try:
-        with get_conn(db_path) as conn:
+        with closing(get_conn(db_path)) as conn:
             conn.execute(
                 """
                 INSERT INTO registrations
@@ -77,7 +80,7 @@ def save_application(
 
 def check_duplicate_minecraft_nick(nick: str, db_path: Path | None = None) -> bool:
     init_db(db_path)
-    with get_conn(db_path) as conn:
+    with closing(get_conn(db_path)) as conn:
         row = conn.execute(
             "SELECT 1 FROM registrations WHERE lower(minecraft_nick) = lower(?) LIMIT 1",
             (nick,),
@@ -87,7 +90,7 @@ def check_duplicate_minecraft_nick(nick: str, db_path: Path | None = None) -> bo
 
 def check_duplicate_telegram(telegram_id: int, db_path: Path | None = None) -> bool:
     init_db(db_path)
-    with get_conn(db_path) as conn:
+    with closing(get_conn(db_path)) as conn:
         row = conn.execute(
             "SELECT 1 FROM registrations WHERE telegram_id = ? LIMIT 1", (telegram_id,)
         ).fetchone()
