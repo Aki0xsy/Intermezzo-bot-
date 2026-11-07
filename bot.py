@@ -23,6 +23,7 @@ from aiogram.types import (
 from aiogram.utils.keyboard import InlineKeyboardBuilder, ReplyKeyboardBuilder
 
 import config
+import sheets
 import storage
 from validators import (
     validate_age,
@@ -339,6 +340,14 @@ async def cb_confirm(callback: CallbackQuery, state: FSMContext, bot: Bot) -> No
     )
     await callback.answer("Заявка отправлена!")
 
+        # Пишем в Google Sheets
+    try:
+        sheets_ok = await sheets.append_application(data, callback.from_user.id, callback.from_user.username)
+        if not sheets_ok and config.GOOGLE_SHEETS_ID:
+            log.warning("Заявка сохранена локально, но не попала в Google Sheets")
+    except Exception as e:  # noqa: BLE001
+        log.warning("Google Sheets error: %s", e)
+
     # Уведомляем админов
     admin_text = format_admin_message(data, callback.from_user.id, callback.from_user.username)
     for admin_id in config.ADMIN_IDS:
@@ -366,6 +375,11 @@ async def main() -> None:
     if not config.BOT_TOKEN:
         raise SystemExit("❌ Не задан BOT_TOKEN. Создай файл .env (см. .env.example).")
     storage.init_db()
+    if config.GOOGLE_SHEETS_ID:
+        try:
+            await asyncio.to_thread(sheets.ensure_header_sync)
+        except Exception as e:  # noqa: BLE001
+            log.warning("Sheets init warning: %s", e)
     bot = Bot(token=config.BOT_TOKEN)
     dp = Dispatcher()
     dp.include_router(router)

@@ -22,3 +22,9 @@ WEBHOOK_BASE_URL = os.getenv("WEBHOOK_BASE_URL", "").rstrip("/")
 WEBHOOK_SECRET = os.getenv("WEBHOOK_SECRET", "")
 WEBHOOK_PATH = "/webhook"
 PORT = int(os.getenv("PORT", "8000"))
+# --- Google Sheets ---
+GOOGLE_SHEETS_ID = os.getenv("GOOGLE_SHEETS_ID", "").strip()
+GOOGLE_SHEET_NAME = os.getenv("GOOGLE_SHEET_NAME", "Sheet1").strip() or "Sheet1"
+GOOGLE_SERVICE_ACCOUNT_JSON = os.getenv("GOOGLE_SERVICE_ACCOUNT_JSON", "").strip()
+GOOGLE_SERVICE_ACCOUNT_FILE = os.getenv("GOOGLE_SERVICE_ACCOUNT_FILE", "").strip()
+SHEET_HEADER = ["Дата", "Имя", "Возраст", "Страна", "Ник Minecraft", "Ник Discord", "Telegram ID", "Telegram", "Статус"]
