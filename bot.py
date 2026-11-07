@@ -390,8 +390,6 @@ async def main() -> None:
 
     # FSM поверх SQLite — переживает redeploy и рестарт контейнера.
     # На Railway volume /app/data/fsm.db (там же data/registrations.db).
-    from aiogram.fsm.storage.memory import MemoryStorage
-    from aiogram.fsm.storage.redis import RedisStorage
     from aiogram.fsm.storage.base import StorageKey
 
     import asyncio as _asyncio
@@ -467,15 +465,7 @@ async def main() -> None:
     from pathlib import Path as _P
     fsm_path = _P(__file__).parent / "data" / "fsm.db"
 
-    redis_url = config.REDIS_URL if hasattr(config, "REDIS_URL") else os.getenv("REDIS_URL", "")
-    if redis_url:
-        try:
-            storage_engine = RedisStorage.from_url(redis_url)
-        except Exception:
-            storage_engine = DiskFSMStorage(fsm_path)
-    else:
-        storage_engine = DiskFSMStorage(fsm_path)
-
+    storage_engine = DiskFSMStorage(fsm_path)
     dp = Dispatcher(storage=storage_engine)
     dp.include_router(router)
 
