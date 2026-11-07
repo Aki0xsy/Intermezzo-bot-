@@ -75,3 +75,20 @@ def test_discord(raw, expected):
     assert ok is (expected is not None)
     if ok:
         assert val == expected
+
+
+from validators import validate_password
+
+
+@pytest.mark.parametrize("raw,ok", [
+    ("Cube!2026x", True),
+    ("123456", True),
+    ("a" * 32, True),
+    ("short", False),
+    ("a" * 33, False),
+    ("with space1", False),
+    ("пароль123", False),
+    ("", False),
+])
+def test_password(raw, ok):
+    assert validate_password(raw)[0] is ok

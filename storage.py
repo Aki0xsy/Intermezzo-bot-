@@ -36,6 +36,11 @@ def init_db(db_path: Path | None = None) -> None:
             )
             """
         )
+        # миграция старой базы: пароль, кто и когда рассмотрел заявку
+        cols = {r[1] for r in conn.execute("PRAGMA table_info(registrations)")}
+        for col in ("password", "reviewed_by", "reviewed_at"):
+            if col not in cols:
+                conn.execute(f"ALTER TABLE registrations ADD COLUMN {col} TEXT")
         conn.commit()
 
 
@@ -45,10 +50,15 @@ def save_application(
     data: dict,
     db_path: Path | None = None,
 ) -> tuple[bool, str]:
-    """Сохраняет заявку. Возвращает (ok, сообщение)."""
+    """Сохраняет заявку. Возвращает (ok, сообщение).
+    Отклонённая ранее заявка этого пользователя заменяется новой."""
     init_db(db_path)
     try:
         with closing(get_conn(db_path)) as conn:
+            conn.execute(
+                "DELETE FROM registrations WHERE telegram_id = ? AND status = 'rejected'",
+                (telegram_id,),
+            )
             conn.execute(
                 """
                 INSERT INTO registrations
@@ -71,27 +81,63 @@ def save_application(
         return True, "Заявка сохранена."
     except sqlite3.IntegrityError as e:
         msg = str(e).lower()
-        if "minecraft_nick" in msg or "unique" in msg and "minecraft" in msg:
+        if "minecraft_nick" in msg:
             return False, "Этот ник Minecraft уже зарегистрирован."
         if "telegram_id" in msg:
             return False, "У тебя уже есть заявка."
         return False, f"Ошибка базы: {e}"
 
 
-def check_duplicate_minecraft_nick(nick: str, db_path: Path | None = None) -> bool:
+def _one(sql: str, args: tuple, db_path: Path | None = None):
     init_db(db_path)
     with closing(get_conn(db_path)) as conn:
-        row = conn.execute(
-            "SELECT 1 FROM registrations WHERE lower(minecraft_nick) = lower(?) LIMIT 1",
-            (nick,),
-        ).fetchone()
-        return row is not None
+        return conn.execute(sql, args).fetchone()
+
+
+def check_duplicate_minecraft_nick(nick: str, db_path: Path | None = None) -> bool:
+    """Ник занят, если есть НЕ отклонённая заявка с таким ником."""
+    return _one(
+        "SELECT 1 FROM registrations WHERE lower(minecraft_nick) = lower(?) AND status != 'rejected' LIMIT 1",
+        (nick,), db_path,
+    ) is not None
 
 
 def check_duplicate_telegram(telegram_id: int, db_path: Path | None = None) -> bool:
+    """Есть активная (pending/approved) заявка. После отклонения можно подать новую."""
+    return _one(
+        "SELECT 1 FROM registrations WHERE telegram_id = ? AND status != 'rejected' LIMIT 1",
+        (telegram_id,), db_path,
+    ) is not None
+
+
+def get_by_telegram(telegram_id: int, db_path: Path | None = None):
+    return _one("SELECT * FROM registrations WHERE telegram_id = ?", (telegram_id,), db_path)
+
+
+def get_by_id(reg_id: int, db_path: Path | None = None):
+    return _one("SELECT * FROM registrations WHERE id = ?", (reg_id,), db_path)
+
+
+def set_status(reg_id: int, status: str, admin_id: int, db_path: Path | None = None) -> bool:
+    """pending -> approved/rejected. False, если заявку уже рассмотрел другой админ."""
     init_db(db_path)
     with closing(get_conn(db_path)) as conn:
-        row = conn.execute(
-            "SELECT 1 FROM registrations WHERE telegram_id = ? LIMIT 1", (telegram_id,)
-        ).fetchone()
-        return row is not None
+        cur = conn.execute(
+            "UPDATE registrations SET status = ?, reviewed_by = ?, reviewed_at = datetime('now') "
+            "WHERE id = ? AND status = 'pending'",
+            (status, str(admin_id), reg_id),
+        )
+        conn.commit()
+        return cur.rowcount == 1
+
+
+def set_password(telegram_id: int, password: str, db_path: Path | None = None) -> bool:
+    """Пароль можно задать только одобренной заявке."""
+    init_db(db_path)
+    with closing(get_conn(db_path)) as conn:
+        cur = conn.execute(
+            "UPDATE registrations SET password = ? WHERE telegram_id = ? AND status = 'approved'",
+            (password, telegram_id),
+        )
+        conn.commit()
+        return cur.rowcount == 1

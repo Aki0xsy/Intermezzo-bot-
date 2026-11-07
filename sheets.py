@@ -111,6 +111,25 @@ def ensure_header_sync() -> bool:
         return False
 
 
+def update_status_sync(telegram_id: int, status: str) -> bool:
+    """Обновляет колонку «Статус» (9-я) в строке игрока (Telegram ID — 7-я колонка)."""
+    if not config.GOOGLE_SHEETS_ID:
+        return False
+    try:
+        client = _get_client()
+        if client is None:
+            return False
+        ws = _resolve_worksheet(client.open_by_key(config.GOOGLE_SHEETS_ID))
+        cell = ws.find(str(telegram_id), in_column=7)
+        if cell is None:
+            return False
+        ws.update_cell(cell.row, 9, status)
+        return True
+    except Exception as e:  # noqa: BLE001
+        log.warning("Google Sheets status update failed: %s", e)
+        return False
+
+
 def build_row(data: dict, telegram_id: int, telegram_username: str | None) -> list[str]:
     now = datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M UTC")
     tg = f"@{telegram_username}" if telegram_username else ""

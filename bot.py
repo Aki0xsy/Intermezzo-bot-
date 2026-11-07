@@ -16,6 +16,7 @@ from aiogram.enums import ParseMode
 from aiogram.filters import Command, CommandStart, ExceptionTypeFilter, StateFilter
 from aiogram.fsm.context import FSMContext
 from aiogram.fsm.state import State, StatesGroup
+from aiogram.fsm.storage.base import StorageKey
 from aiogram.types import (
     CallbackQuery,
     InlineKeyboardButton,
@@ -30,6 +31,7 @@ from aiogram.webhook.aiohttp_server import SimpleRequestHandler, setup_applicati
 
 import config
 import sheets
+import server
 import storage
 from fsm_storage import SQLiteStorage
 from validators import (
@@ -38,6 +40,7 @@ from validators import (
     validate_discord_nick,
     validate_minecraft_nick,
     validate_name,
+    validate_password,
 )
 
 logging.basicConfig(
@@ -58,6 +61,11 @@ class RegStates(StatesGroup):
     confirm = State()
 
 
+class PasswordStates(StatesGroup):
+    set_password = State()      # после одобрения заявки
+    change_password = State()   # смена из профиля
+
+
 STEPS = [
     ("name", "👤 Как тебя зовут?", "Напиши имя (2–50 символов).", validate_name),
     ("age", "🎂 Сколько тебе лет?", "Введи возраст числом.", lambda v: validate_age(v, config.MIN_AGE, config.MAX_AGE)),
@@ -76,10 +84,30 @@ FIELD_LABELS = {
 }
 
 
-def main_menu_kb() -> InlineKeyboardMarkup:
+def main_menu_kb(user_id: int | None = None) -> InlineKeyboardMarkup:
     b = InlineKeyboardBuilder()
-    b.button(text="📝 Заполнить заявку", callback_data="start_reg")
+    reg = storage.get_by_telegram(user_id) if user_id else None
+    if reg and reg["status"] == "approved":
+        b.button(text="👤 Профиль", callback_data="profile")
+    elif not reg or reg["status"] == "rejected":
+        b.button(text="📝 Заполнить заявку", callback_data="start_reg")
     b.button(text="ℹ️ О сервере", callback_data="about_server")
+    b.adjust(1)
+    return b.as_markup()
+
+
+def admin_kb(reg_id: int) -> InlineKeyboardMarkup:
+    b = InlineKeyboardBuilder()
+    b.button(text="✅ Принять", callback_data=f"adm:ok:{reg_id}")
+    b.button(text="❌ Отклонить", callback_data=f"adm:no:{reg_id}")
+    b.adjust(2)
+    return b.as_markup()
+
+
+def profile_kb() -> InlineKeyboardMarkup:
+    b = InlineKeyboardBuilder()
+    b.button(text="🔄 Обновить", callback_data="profile")
+    b.button(text="🔑 Сменить пароль", callback_data="change_password")
     b.adjust(1)
     return b.as_markup()
 
@@ -155,7 +183,7 @@ async def cmd_start(message: Message, state: FSMContext) -> None:
         "Чтобы подать заявку, нажми «📝 Заполнить заявку» и ответь на 5 коротких вопросов:\n"
         "имя, возраст, страна, ник Minecraft и ник Discord.\n\n"
         "В любой момент можно прервать: /cancel",
-        reply_markup=main_menu_kb(),
+        reply_markup=main_menu_kb(message.from_user.id),
         parse_mode=ParseMode.HTML,
     )
 
@@ -166,7 +194,7 @@ async def cmd_cancel(message: Message, state: FSMContext) -> None:
     await state.clear()
     if was:
         await message.answer("❌ Заявка отменена.", reply_markup=ReplyKeyboardRemove())
-    await message.answer("Меню:", reply_markup=main_menu_kb())
+    await message.answer("Меню:", reply_markup=main_menu_kb(message.from_user.id))
 
 
 @router.message(F.text.in_({"❌ Отмена", "Отмена", "cancel"}))
@@ -175,7 +203,7 @@ async def text_cancel(message: Message, state: FSMContext) -> None:
     await state.clear()
     if was:
         await message.answer("❌ Заявка отменена.", reply_markup=ReplyKeyboardRemove())
-    await message.answer("Меню:", reply_markup=main_menu_kb())
+    await message.answer("Меню:", reply_markup=main_menu_kb(message.from_user.id))
 
 
 @router.message(Command("help"))
@@ -183,7 +211,7 @@ async def cmd_help(message: Message) -> None:
     await message.answer(
         "Команды:\n/start — главное меню\n/cancel — отменить заполнение\n/help — эта справка\n\n"
         "Вопросы по заполнению — просто напиши, и бот подскажет.",
-        reply_markup=main_menu_kb(),
+        reply_markup=main_menu_kb(message.from_user.id),
     )
 
 
@@ -192,7 +220,7 @@ async def text_about(message: Message) -> None:
     await message.answer(
         f"<b>{config.SERVER_NAME}</b>\nIP: <code>{config.SERVER_IP}</code>\n\n"
         "Заполни заявку — и администрация рассмотрит её. После одобрения ты получишь доступ.",
-        reply_markup=main_menu_kb(),
+        reply_markup=main_menu_kb(message.from_user.id),
         parse_mode=ParseMode.HTML,
     )
 
@@ -207,7 +235,7 @@ async def cb_about(callback: CallbackQuery) -> None:
     await callback.message.answer(
         f"<b>{config.SERVER_NAME}</b>\nIP: <code>{config.SERVER_IP}</code>\n\n"
         "Нажми «📝 Заполнить заявку», чтобы пройти опросник.",
-        reply_markup=main_menu_kb(),
+        reply_markup=main_menu_kb(callback.from_user.id),
         parse_mode=ParseMode.HTML,
     )
     await _safe_answer(callback)
@@ -229,7 +257,7 @@ async def cb_restart(callback: CallbackQuery, state: FSMContext) -> None:
 @router.callback_query(F.data == "cancel_reg")
 async def cb_cancel(callback: CallbackQuery, state: FSMContext) -> None:
     await state.clear()
-    await callback.message.answer("❌ Заявка отменена.", reply_markup=main_menu_kb())
+    await callback.message.answer("❌ Заявка отменена.", reply_markup=main_menu_kb(callback.from_user.id))
     await _safe_answer(callback)
 
 
@@ -316,7 +344,7 @@ async def cb_confirm(callback: CallbackQuery, state: FSMContext, bot: Bot) -> No
     if storage.check_duplicate_telegram(callback.from_user.id):
         await callback.message.answer(
             "⚠️ У тебя уже есть заявка. Если хочешь подать ещё одну — напиши админу.",
-            reply_markup=main_menu_kb(),
+            reply_markup=main_menu_kb(callback.from_user.id),
         )
         await state.clear()
         await _safe_answer(callback)
@@ -324,7 +352,7 @@ async def cb_confirm(callback: CallbackQuery, state: FSMContext, bot: Bot) -> No
     if storage.check_duplicate_minecraft_nick(data.get("minecraft_nick", "")):
         await callback.message.answer(
             "⚠️ Этот ник Minecraft уже занят. Заполни заявку заново с другим ником.",
-            reply_markup=main_menu_kb(),
+            reply_markup=main_menu_kb(callback.from_user.id),
         )
         await state.clear()
         await _safe_answer(callback)
@@ -337,7 +365,7 @@ async def cb_confirm(callback: CallbackQuery, state: FSMContext, bot: Bot) -> No
         await _safe_answer(callback, "Сессия заявки устарела", show_alert=True)
         await callback.message.answer(
             "⚠️ Сессия заявки устарела.\n\nНачни регистрацию заново: нажми «📝 Заполнить заявку».",
-            reply_markup=main_menu_kb(),
+            reply_markup=main_menu_kb(callback.from_user.id),
         )
         return
 
@@ -347,7 +375,7 @@ async def cb_confirm(callback: CallbackQuery, state: FSMContext, bot: Bot) -> No
         data=data,
     )
     if not ok:
-        await callback.message.answer(f"❌ Не удалось сохранить: {msg}", reply_markup=main_menu_kb())
+        await callback.message.answer(f"❌ Не удалось сохранить: {msg}", reply_markup=main_menu_kb(callback.from_user.id))
         await _safe_answer(callback)
         return
 
@@ -358,7 +386,7 @@ async def cb_confirm(callback: CallbackQuery, state: FSMContext, bot: Bot) -> No
         f"{format_summary(data)}\n\n"
         "Администрация проверит её и, если всё ок, выдаст доступ.\n"
         "Обычно это занимает от пары часов до суток. Спасибо за терпение!",
-        reply_markup=main_menu_kb(),
+        reply_markup=main_menu_kb(callback.from_user.id),
         parse_mode=ParseMode.HTML,
     )
 
@@ -372,11 +400,179 @@ async def cb_confirm(callback: CallbackQuery, state: FSMContext, bot: Bot) -> No
 
     # Уведомляем админов
     admin_text = format_admin_message(data, callback.from_user.id, callback.from_user.username)
+    reg = storage.get_by_telegram(callback.from_user.id)
+    admin_markup = admin_kb(reg["id"]) if reg else None
     for admin_id in config.ADMIN_IDS:
         try:
-            await bot.send_message(admin_id, admin_text, parse_mode=ParseMode.HTML)
+            await bot.send_message(admin_id, admin_text, parse_mode=ParseMode.HTML, reply_markup=admin_markup)
         except Exception as e:  # noqa: BLE001 — не падаем, если админ заблокировал бота
             log.warning("Не удалось отправить админу %s: %s", admin_id, e)
+
+
+# ---------- Решение админа ----------
+
+@router.callback_query(F.data.regexp(r"^adm:(ok|no):\d+$"))
+async def cb_admin_decision(callback: CallbackQuery, bot: Bot, dispatcher: Dispatcher) -> None:
+    if callback.from_user.id not in config.ADMIN_IDS:
+        await _safe_answer(callback, "Только для администраторов.", show_alert=True)
+        return
+    _, action, reg_id_s = callback.data.split(":")
+    reg = storage.get_by_id(int(reg_id_s))
+    if not reg:
+        await _safe_answer(callback, "Заявка не найдена.", show_alert=True)
+        return
+
+    who = f"@{callback.from_user.username}" if callback.from_user.username else str(callback.from_user.id)
+    new_status = "approved" if action == "ok" else "rejected"
+    if not storage.set_status(reg["id"], new_status, callback.from_user.id):
+        # уже рассмотрена (другим админом или повторным нажатием) — просто убираем кнопки
+        fresh = storage.get_by_id(reg["id"])
+        await _safe_answer(callback, f"Уже рассмотрена: {fresh['status']}", show_alert=True)
+        try:
+            await callback.message.edit_reply_markup(reply_markup=None)
+        except Exception:  # noqa: BLE001
+            pass
+        return
+
+    mark = "✅ Принята" if new_status == "approved" else "❌ Отклонена"
+    try:
+        await callback.message.edit_text(
+            f"{callback.message.html_text}\n\n<b>{mark}</b> — {_e(who)}",
+            parse_mode=ParseMode.HTML,
+            reply_markup=None,
+        )
+    except Exception as e:  # noqa: BLE001
+        log.warning("Не удалось обновить сообщение админа: %s", e)
+    await _safe_answer(callback, mark)
+
+    try:
+        await asyncio.to_thread(sheets.update_status_sync, reg["telegram_id"], new_status)
+    except Exception as e:  # noqa: BLE001
+        log.warning("Sheets status update error: %s", e)
+
+    uid = reg["telegram_id"]
+    try:
+        if new_status == "approved":
+            # переводим игрока в состояние «придумай пароль»
+            ctx = FSMContext(storage=dispatcher.storage, key=StorageKey(bot_id=bot.id, chat_id=uid, user_id=uid))
+            await ctx.clear()
+            await ctx.set_state(PasswordStates.set_password)
+            await bot.send_message(
+                uid,
+                "🎉 <b>Твоя заявка принята!</b>\n\n"
+                "Теперь придумай <b>пароль для входа на сервер</b> и отправь его следующим сообщением.\n"
+                "6–32 символа: английские буквы, цифры, знаки, без пробелов.\n\n"
+                "Сообщение с паролем я удалю из чата после сохранения.",
+                parse_mode=ParseMode.HTML,
+                reply_markup=cancel_kb(),
+            )
+        else:
+            await bot.send_message(
+                uid,
+                "😔 К сожалению, заявка отклонена. Ты можешь подать новую — нажми «📝 Заполнить заявку».",
+                reply_markup=main_menu_kb(uid),
+            )
+    except Exception as e:  # noqa: BLE001
+        log.warning("Не удалось уведомить игрока %s: %s", uid, e)
+        await callback.message.answer(
+            f"⚠️ Не смог написать игроку {uid} (он не запускал бота или заблокировал его)."
+        )
+
+
+# ---------- Пароль и профиль ----------
+
+async def _save_password(message: Message, state: FSMContext, first_time: bool) -> None:
+    ok, result = validate_password(message.text or "")
+    if not ok:
+        await message.answer(f"❌ {result}\n\nПопробуй ещё раз:", reply_markup=cancel_kb())
+        return
+    if not storage.set_password(message.from_user.id, result):
+        await state.clear()
+        await message.answer("⚠️ Пароль можно задать только после одобрения заявки.",
+                             reply_markup=main_menu_kb(message.from_user.id))
+        return
+    await state.clear()
+    try:  # пароль не должен оставаться в истории чата
+        await message.delete()
+    except Exception:  # noqa: BLE001
+        pass
+    reg = storage.get_by_telegram(message.from_user.id)
+    try:
+        await server.push_password(reg["minecraft_nick"], result)
+    except Exception as e:  # noqa: BLE001
+        log.warning("push_password failed: %s", e)
+    await message.answer(
+        ("✅ Пароль создан!" if first_time else "✅ Пароль изменён!")
+        + "\nПосмотреть его можно в профиле.",
+        reply_markup=ReplyKeyboardRemove(),
+    )
+    await message.answer("Открой профиль:", reply_markup=main_menu_kb(message.from_user.id))
+
+
+@router.message(StateFilter(PasswordStates.set_password))
+async def handle_set_password(message: Message, state: FSMContext) -> None:
+    await _save_password(message, state, first_time=True)
+
+
+@router.message(StateFilter(PasswordStates.change_password))
+async def handle_change_password(message: Message, state: FSMContext) -> None:
+    await _save_password(message, state, first_time=False)
+
+
+async def _profile_text(reg) -> str:
+    online = await server.is_online(reg["minecraft_nick"])
+    online_line = {True: "🟢 Онлайн", False: "🔴 Не в сети", None: "⚪ Неизвестно (плагин сервера ещё не подключён)"}[online]
+    password = reg["password"]
+    return (
+        "👤 <b>Профиль</b>\n\n"
+        f"⛏️ Ник: <b>{_e(reg['minecraft_nick'])}</b>\n"
+        f"🔑 Пароль: <code>{_e(password) if password else 'не задан'}</code>\n"
+        f"📡 Статус на сервере: {online_line}"
+    )
+
+
+@router.message(Command("profile"))
+async def cmd_profile(message: Message, state: FSMContext) -> None:
+    await state.clear()
+    reg = storage.get_by_telegram(message.from_user.id)
+    if not reg or reg["status"] != "approved":
+        await message.answer("Профиль появится после одобрения заявки.", reply_markup=main_menu_kb(message.from_user.id))
+        return
+    await message.answer(await _profile_text(reg), reply_markup=profile_kb(), parse_mode=ParseMode.HTML)
+
+
+@router.callback_query(F.data == "profile")
+async def cb_profile(callback: CallbackQuery) -> None:
+    reg = storage.get_by_telegram(callback.from_user.id)
+    if not reg or reg["status"] != "approved":
+        await _safe_answer(callback, "Профиль появится после одобрения заявки.", show_alert=True)
+        return
+    text = await _profile_text(reg)
+    try:
+        if callback.message.html_text == text:  # «Обновить» без изменений — Telegram ругается на одинаковый текст
+            await _safe_answer(callback, "Без изменений")
+            return
+        await callback.message.edit_text(text, reply_markup=profile_kb(), parse_mode=ParseMode.HTML)
+    except Exception:  # noqa: BLE001
+        await callback.message.answer(text, reply_markup=profile_kb(), parse_mode=ParseMode.HTML)
+    await _safe_answer(callback)
+
+
+@router.callback_query(F.data == "change_password")
+async def cb_change_password(callback: CallbackQuery, state: FSMContext) -> None:
+    reg = storage.get_by_telegram(callback.from_user.id)
+    if not reg or reg["status"] != "approved":
+        await _safe_answer(callback, "Сначала нужно одобрение заявки.", show_alert=True)
+        return
+    await state.clear()
+    await state.set_state(PasswordStates.change_password)
+    await callback.message.answer(
+        "🔑 Отправь <b>новый пароль</b> (6–32 символа: английские буквы, цифры, знаки, без пробелов).\n"
+        "Сообщение с ним я удалю после сохранения.",
+        parse_mode=ParseMode.HTML,
+        reply_markup=cancel_kb(),
+    )
+    await _safe_answer(callback)
 
 
 @router.callback_query()
@@ -405,7 +601,7 @@ async def fallback(message: Message, state: FSMContext) -> None:
     if await state.get_state():
         await message.answer("Бот ждёт твой ответ на текущий вопрос 👆\n\nОтмена — /cancel")
     else:
-        await message.answer("Нажми /start, чтобы открыть меню.", reply_markup=main_menu_kb())
+        await message.answer("Нажми /start, чтобы открыть меню.", reply_markup=main_menu_kb(message.from_user.id))
 
 
 async def health(request: web.Request) -> web.Response:

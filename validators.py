@@ -78,3 +78,18 @@ def validate_discord_nick(value: str) -> tuple[bool, str]:
         "Ник Discord: укажи username, например @steve или steve_2026 "
         "(строчные буквы, цифры, точки и «_»). Можно с @ в начале."
     )
+
+
+PASSWORD_RE = re.compile(r"^[\x21-\x7E]{6,32}$")  # печатные ASCII без пробелов
+
+
+def validate_password(value: str) -> tuple[bool, str]:
+    """Пароль для входа на сервер: 6-32 символа, латиница/цифры/знаки, без пробелов
+    (его вводят командой в игровом чате)."""
+    v = value or ""
+    if not PASSWORD_RE.fullmatch(v):
+        return False, (
+            "Пароль: 6–32 символа, только английские буквы, цифры и знаки, без пробелов. "
+            "Например: Cube!2026x"
+        )
+    return True, v
