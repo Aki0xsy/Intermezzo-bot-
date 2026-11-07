@@ -2,9 +2,13 @@
 
 Поток: /start -> кнопка "Заполнить заявку" -> опросник из 5 вопросов ->
 проверка данных -> превью -> подтверждение -> сохранение + уведомление админа.
+
+ВАЖНО: FSM storage — SQLite на диске (Railway даёт volume). В memory всё слетает
+при каждом redeploy/краше, и кнопка подтверждения уходит в "Сессия устарела".
 """
 import asyncio
 import logging
+import os
 from aiohttp import web
 
 from aiogram import Bot, Dispatcher, F, Router
@@ -75,14 +79,6 @@ def main_menu_kb() -> InlineKeyboardMarkup:
     b.button(text="ℹ️ О сервере", callback_data="about_server")
     b.adjust(1)
     return b.as_markup()
-
-
-def main_menu_kb_reply() -> ReplyKeyboardMarkup:
-    b = ReplyKeyboardBuilder()
-    b.button(text="📝 Заполнить заявку")
-    b.button(text="ℹ️ О сервере")
-    b.adjust(1)
-    return b.as_markup(resize_keyboard=True, one_time_keyboard=False)
 
 
 def confirm_kb() -> InlineKeyboardMarkup:
@@ -245,12 +241,10 @@ async def _ask_step(message: Message, state: FSMContext, step_index: int) -> Non
                             RegStates.minecraft_nick, RegStates.discord_nick))
 async def handle_answer(message: Message, state: FSMContext) -> None:
     fsm_state = await state.get_state()
-    # Определяем поле по имени состояния
-    field = fsm_state.split(":")[-1]  # RegStates:name -> name
+    field = fsm_state.split(":")[-1]
     step_index = STEP_FIELDS.index(field)
     _, _, _, validator = STEPS[step_index]
 
-    # Анти-спам: слишком длинное сообщение
     if message.text and len(message.text) > 200:
         await message.answer("⚠️ Сообщение слишком длинное. Коротко и по делу 😄\n\nПопробуй ещё раз:")
         return
@@ -262,7 +256,6 @@ async def handle_answer(message: Message, state: FSMContext) -> None:
 
     ok, result = validator(raw)
 
-    # Дополнительные проверки, которые требуют БД
     if ok and field == "minecraft_nick":
         if storage.check_duplicate_minecraft_nick(result):
             ok = False
@@ -277,18 +270,19 @@ async def handle_answer(message: Message, state: FSMContext) -> None:
         )
         return
 
-    # Сохраняем ответ
     fsm_data = await state.get_data()
     data: dict = fsm_data.get("data", {})
     data[field] = result
     await state.update_data(data=data)
+    log.info("FSM save: %s (%s)", field, list(data.keys()))
 
     next_index = step_index + 1
     if next_index < len(STEPS):
         await _ask_step(message, state, next_index)
     else:
-        # Все шаги пройдены — показываем превью
         await state.set_state(RegStates.confirm)
+        await state.update_data(data=data)
+        log.info("FSM confirm: %s", list(data.keys()))
         await message.answer(
             format_summary(data),
             reply_markup=confirm_kb(),
@@ -300,8 +294,8 @@ async def handle_answer(message: Message, state: FSMContext) -> None:
 async def cb_confirm(callback: CallbackQuery, state: FSMContext, bot: Bot) -> None:
     fsm_data = await state.get_data()
     data: dict = fsm_data.get("data", {})
+    log.info("FSM confirm data: %s", list(data.keys()))
 
-    # Повторные проверки на случай гонки
     if storage.check_duplicate_telegram(callback.from_user.id):
         await callback.message.answer(
             "⚠️ У тебя уже есть заявка. Если хочешь подать ещё одну — напиши админу.",
@@ -321,6 +315,7 @@ async def cb_confirm(callback: CallbackQuery, state: FSMContext, bot: Bot) -> No
 
     required = ("name", "age", "country", "minecraft_nick", "discord_nick")
     if any(not str(data.get(field, "")).strip() for field in required):
+        log.warning("Incomplete data in confirm: %s", data)
         await state.clear()
         await callback.answer("Сессия заявки устарела", show_alert=True)
         await callback.message.answer(
@@ -390,8 +385,98 @@ async def main() -> None:
             await asyncio.to_thread(sheets.ensure_header_sync)
         except Exception as e:  # noqa: BLE001
             log.warning("Sheets init warning: %s", e)
+
     bot = Bot(token=config.BOT_TOKEN)
-    dp = Dispatcher()
+
+    # FSM поверх SQLite — переживает redeploy и рестарт контейнера.
+    # На Railway volume /app/data/fsm.db (там же data/registrations.db).
+    from aiogram.fsm.storage.memory import MemoryStorage
+    from aiogram.fsm.storage.redis import RedisStorage
+    from aiogram.fsm.storage.base import StorageKey
+
+    import asyncio as _asyncio
+
+    class DiskFSMStorage:
+        """Мини-хранилище поверх sqlite3: state + data на каждый (chat_id, user_id)."""
+        def __init__(self, path):
+            self.path = path
+            import sqlite3
+            self._sql = sqlite3
+
+        def _conn(self):
+            self.path.parent.mkdir(parents=True, exist_ok=True)
+            c = self._sql.connect(str(self.path))
+            c.execute("""CREATE TABLE IF NOT EXISTS fsm (
+                chat_id INTEGER, user_id INTEGER,
+                state TEXT, data TEXT,
+                PRIMARY KEY(chat_id, user_id)
+            )""")
+            c.commit()
+            return c
+
+        async def get_state(self, key: StorageKey):
+            return await _asyncio.to_thread(self._get_state, key)
+
+        def _get_state(self, key):
+            with self._conn() as c:
+                row = c.execute("SELECT state FROM fsm WHERE chat_id=? AND user_id=?",
+                                (key.chat_id, key.user_id)).fetchone()
+                return row[0] if row else None
+
+        async def set_state(self, key: StorageKey, state=None):
+            return await _asyncio.to_thread(self._set_state, key, state)
+
+        def _set_state(self, key, state):
+            with self._conn() as c:
+                c.execute("""INSERT INTO fsm (chat_id, user_id, state, data)
+                    VALUES (?, ?, ?, COALESCE((SELECT data FROM fsm WHERE chat_id=? AND user_id=?), '{}'))
+                    ON CONFLICT(chat_id, user_id) DO UPDATE SET state=excluded.state""",
+                    (key.chat_id, key.user_id, state, key.chat_id, key.user_id))
+                c.commit()
+
+        async def get_data(self, key: StorageKey):
+            return await _asyncio.to_thread(self._get_data, key)
+
+        def _get_data(self, key):
+            import json
+            with self._conn() as c:
+                row = c.execute("SELECT data FROM fsm WHERE chat_id=? AND user_id=?",
+                                (key.chat_id, key.user_id)).fetchone()
+                if not row or not row[0]:
+                    return {}
+                try:
+                    return json.loads(row[0])
+                except Exception:
+                    return {}
+
+        async def set_data(self, key: StorageKey, data: dict):
+            return await _asyncio.to_thread(self._set_data, key, data)
+
+        def _set_data(self, key, data):
+            import json
+            with self._conn() as c:
+                c.execute("""INSERT INTO fsm (chat_id, user_id, state, data)
+                    VALUES (?, ?, NULL, ?)
+                    ON CONFLICT(chat_id, user_id) DO UPDATE SET data=excluded.data""",
+                    (key.chat_id, key.user_id, json.dumps(data, ensure_ascii=False)))
+                c.commit()
+
+        async def close(self):
+            pass
+
+    from pathlib import Path as _P
+    fsm_path = _P(__file__).parent / "data" / "fsm.db"
+
+    redis_url = config.REDIS_URL if hasattr(config, "REDIS_URL") else os.getenv("REDIS_URL", "")
+    if redis_url:
+        try:
+            storage_engine = RedisStorage.from_url(redis_url)
+        except Exception:
+            storage_engine = DiskFSMStorage(fsm_path)
+    else:
+        storage_engine = DiskFSMStorage(fsm_path)
+
+    dp = Dispatcher(storage=storage_engine)
     dp.include_router(router)
 
     if config.USE_WEBHOOK:
@@ -407,11 +492,8 @@ async def main() -> None:
         app = web.Application()
         app.router.add_get("/health", health)
         app.router.add_get("/", health)
-        # aiogram >=3: Dispatcher.webhook нет, используем ручную регистрацию
-        webhook_app = None
         try:
-            from aiogram.webhook.aiohttp_server import SimpleRequestHandler as AiohttpWebhookHandler
-            webhook_app = None  # не нужен, используем feed_webhook_update напрямую
+            from aiogram.webhook.aiohttp_server import SimpleRequestHandler
             async def _webhook_handler(request: web.Request):
                 try:
                     data = await request.json()
@@ -421,7 +503,6 @@ async def main() -> None:
                 return web.Response(status=200)
             app.router.add_post(config.WEBHOOK_PATH, _webhook_handler)
         except ImportError:
-            # Старый aiogram: dp.webhook существует
             await dp.webhook(app, config.WEBHOOK_PATH)  # type: ignore
         runner = web.AppRunner(app)
         await runner.setup()
